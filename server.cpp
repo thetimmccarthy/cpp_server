@@ -10,9 +10,10 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
 
 #define PORT "8080"
-#define MAXDATASIZE 100
+#define MAXDATASIZE 256
 #define BACKLOG 10
 
 void sigchild_handler(int s){
@@ -29,67 +30,90 @@ void *get_in_addr(struct sockaddr *sa) {
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int main (int argc, char *argv[]) {
-    int numbytes;
-    char buf[MAXDATASIZE];
-    int sockfd, new_fd; // sockfd listens, new_fd gets new connections
+int getListenerSocket() {
+    int listener;
     struct addrinfo hints, *servinfo, *p;
-    struct sockaddr_storage their_addr; //connector's address info
-    socklen_t sin_size;
-    struct sigaction sa;
-    int yes=1;
-    char s[INET6_ADDRSTRLEN];
-
     int rv;
+    int yes = 1;
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC; // could be AF_INET or AF_INET6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE; // system gets IP address for server
-
-    // puts info into servinfo, a pointer to the headnode of a linked list - servinfo
-    // first param is domain name, but we set to passive
-    // gives a linkedlist bc name may have several IP addresses
+    hints.ai_flags = AI_PASSIVE;
+    
     rv = getaddrinfo(NULL, PORT, &hints, &servinfo);
 
     if (rv != 0) {
-        fprintf(stderr, "getaddringo: %s\n", gai_strerror(rv));
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
     }
-    
-    for (p = servinfo; p != NULL; p = p->ai_next) {
-        sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
 
-        if (sockfd == -1) {
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (listener == -1) {
             perror("server: socket");
             continue;
         }
 
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+        
+        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes , sizeof(int)) == -1) {
             perror("setsockopt");
-            exit(1);
+            continue;
         }
 
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
+        if (bind(listener, p->ai_addr, p->ai_addrlen) == -1) {
+            close(listener);
             perror("server: bind");
             continue;
         }
 
         break; // if you get here, socket is bound properly
+
     }
 
     freeaddrinfo(servinfo);
 
     if (p == NULL) {
-        fprintf(stderr, "server: failed to bind\n");
-        exit(1);
+        fprintf(stderr, "server: failed to bind");
+        return -1;
     }
 
-    if (listen(sockfd, BACKLOG) == -1) {
+    if (listen(listener, BACKLOG) == -1) {
         perror("listen");
-        exit(1);
+        return -1;
     }
 
+    return listener;
+
+}
+
+void add_to_pfds(struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size) {
+    if (*fd_count == *fd_size) {
+        *fd_size *= 2;
+        *pfds = (pollfd*) realloc(*pfds, sizeof(**pfds) * (*fd_size)); // explicit conversion necessary for c++
+    }
+
+    (*pfds)[*fd_count].fd = newfd; // add file descriptor to next open spot of array
+    (*pfds)[*fd_count].events = POLLIN;
+
+    (*fd_count)++;
+}
+
+void del_from_pdfs(struct pollfd *pfds, int i, int *fd_count) {
+    pfds[i] = pfds[*fd_count - 1];
+    (*fd_count)--;
+}
+
+
+int main (int argc, char *argv[]) {
+    int numbytes;
+    char buf[MAXDATASIZE];
+    int sockfd, new_fd; // sockfd listens, new_fd gets new connections
+    struct sockaddr_storage their_addr; //connector's address info
+    socklen_t sin_size;
+    struct sigaction sa;
+    char s[INET6_ADDRSTRLEN];
+    
+    // not sure we need this still?
     sa.sa_handler = sigchild_handler; // reap all dead processes
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
@@ -98,47 +122,84 @@ int main (int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("Server: waiting for connection...\n");
+    int fd_count = 0;
+    int fd_size = 5;
+    struct pollfd* pfds = (pollfd*) malloc(sizeof(pollfd) * fd_size);
 
-    while(1) {
-        sin_size = sizeof their_addr;
-        new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-        if (new_fd == -1) {
-            perror("accept");
-            continue;
-        }
+    if ((sockfd = getListenerSocket()) == -1) {
+        perror("server: socket failed to connect");
+        exit(1);
+    };
 
-        inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-
-        printf("server: got connection from %s\n", s);
-
-        // if (!fork()) { // this is the child process
-        //     close(sockfd); // child doesnt need the listener
-        //     if (send(new_fd, "Hello world!\n", sizeof("Hello world!\n"), 0) == -1 ) {
-        //         perror("send");
-        //     } 
-        //     close(new_fd);
-        //     exit(0);
-            
-        // }
-    numbytes = recv(new_fd, buf, MAXDATASIZE-1, 0);
-    if (numbytes == -1) {
-        perror("recv");
+    if (sockfd == -1) {
+        fprintf(stderr, "error getting listening socket\n");
         exit(1);
     }
 
-    buf[numbytes] = '\0';
+    printf("Server: waiting for connection...\n");
 
-    printf("server: received %s\n", buf);    
+    pfds[0].fd = sockfd;
+    pfds[0].events = POLLIN;
+    fd_count = 1; // for sockfd, the listening socket
+    
 
-    if (!fork()) { // this is the child process
-            close(sockfd); // child doesnt need the listener
-            if (send(new_fd, buf, sizeof(buf), 0) == -1 ) {
-                perror("send");
-            } 
-            close(new_fd);
-            exit(0);
-            
+    while(1) {
+
+        int poll_count = poll(pfds, fd_count, -1);
+
+        if (poll_count == -1) {
+            perror("poll");
+            exit(1);
+        }
+
+        for (int i = 0; i < fd_count; i++) {
+            if (pfds[i].revents & POLLIN) {
+                
+                if (pfds[i].fd == sockfd) {
+                    sin_size = sizeof(their_addr);
+                    new_fd = accept(sockfd,(struct sockaddr *)&their_addr, &sin_size);
+
+                    if (new_fd == -1) {
+                        perror("accept");
+                    } else {
+                        add_to_pfds(&pfds, new_fd, &fd_count, &fd_size);
+
+                        printf("pollserver: new connection from %s on socket %d\n", inet_ntop(their_addr.ss_family, 
+                            get_in_addr((struct sockaddr *)&their_addr), s, sizeof(s)), new_fd);
+                    }
+
+
+                } else {
+                    int nbytes = recv(pfds[i].fd, buf, sizeof buf, 0);
+                    int sender_fd = pfds[i].fd;
+
+                    if (nbytes <= 0) {
+                        if (nbytes == 0) {
+                            printf("pollserver: socket %d hung up\n", sender_fd);
+                        } else {
+                            perror("recv");
+                        }
+
+                        close(pfds[i].fd);
+
+                        del_from_pdfs(pfds, i, &fd_count);
+                    } else {
+                        if (nbytes > 0) {
+                            for (int j = 0; j < fd_count; j++) {
+                                
+                                int dest_fd = pfds[j].fd;
+                                // send to everyone except listener and sender (origin)
+                                if (dest_fd != sockfd && dest_fd != sender_fd) {
+                                    if(send(dest_fd, buf, nbytes, 0) == -1) {
+                                        perror("send");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                }
+            }
         }
 
     }
